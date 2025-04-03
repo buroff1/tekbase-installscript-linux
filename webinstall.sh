@@ -94,7 +94,7 @@ function gen_passwd {
 ##############################
 function gen_logs {
     local input="$1"
-    local log_type="$2"    # "cmd" or "msg" (defaults to "msg" if missing or invalid)
+    local log_type="${2:-msg}"   # default to "msg"
     local log_root="/home/tekbase/logs"
     local timestamp="[$(date +"%Y-%m-%d %H:%M:%S")]"
     local call_origin="$(caller 1)"
@@ -105,8 +105,8 @@ function gen_logs {
     local log_success_file="$log_root/installed.log"
     local log_error_file="$log_root/errors.log"
 
-    # Expanded failure indicators
-    local failure_keywords="fail|missing|not found|could not|error|warning|failed|unable|denied|unreachable|timed out|invalid|broken|no such file|exception"
+    # Smarter failure keywords for actual errors
+    local failure_keywords="fail|could not|error|denied|unable|unreachable|timed out|invalid|broken|exception"
 
     if [ "$log_type" = "cmd" ]; then
         local output
@@ -114,6 +114,7 @@ function gen_logs {
         local exit_code=$?
 
         if [ $exit_code -eq 0 ] && ! echo "$output" | grep -iE "$failure_keywords" >/dev/null; then
+            # Log successful command
             {
                 echo "$timestamp - ✅ Command succeeded: $input"
                 echo "$timestamp - Output:"
@@ -121,6 +122,7 @@ function gen_logs {
                 echo ""
             } | tee -a "$log_success_file"
         else
+            # Log failed command
             {
                 echo "$timestamp - ❌ Command failed: $input"
                 echo "  ↳ Exit Code: $exit_code"
@@ -130,13 +132,18 @@ function gen_logs {
                 echo ""
             } | tee -a "$log_error_file"
         fi
-    else
-        # Default to "msg" type
+    elif [ "$log_type" = "msg" ]; then
+        # Log generic message
         if echo "$input" | grep -iE "$failure_keywords" >/dev/null; then
+            # Log as error if message contains failure keywords
             echo "$timestamp - ⚠️ $input (from: $call_origin)" | tee -a "$log_error_file"
         else
+            # Log as regular success message
             echo "$timestamp - $input" | tee -a "$log_success_file"
         fi
+    else
+        # Unknown log type - treat as warning
+        echo "$timestamp - ⚠️ Unknown log type '$log_type'. Message: $input (from: $call_origin)" | tee -a "$log_error_file"
     fi
 }
 ##############################
@@ -430,8 +437,7 @@ function select_mode {
     if [ "$langsel" = "1" ]; then
         echo "Installation Auswahl"
         echo ""
-        echo "Waehlen Sie 1 oder 2. Dies ist perfekt fuer Anfaenger geeignet,"
-        echo "welche nur einen Rootserver nutzen."
+        echo "Waehlen Sie bevorzugte Option"
         echo ""
         echo "(1) Webserver + TekBASE + Teamspeak 3 + Rootserver Einrichtung"
         echo "(2) Webserver + TekBASE + Rootserver Einrichtung"
@@ -447,8 +453,7 @@ function select_mode {
     else
         echo "Installation selection"
         echo ""
-        echo "Choose 1 or 2. This is perfect for beginners who use only one"
-        echo "dedicated server."
+        echo "Choose preferred option."
         echo ""
         echo "(1) Webserver + TekBASE + Teamspeak 3 + Dedicated installation"
         echo "(2) Webserver + TekBASE + Dedicated installation"
@@ -542,17 +547,21 @@ function select_url {
     [[ "$langsel" = "1" ]] && echo "Domains Auswahl" || echo "Domain selection"
     echo ""
 
+    # Ensure the directory exists
     cd "$1" || { echo "Directory $1 not found!"; gen_logs "Directory $1 not found in select_url." msg; exit 1; }
 
-    mapfile -t url_list < <(find . -maxdepth 1 -type d -printf '%f\n' | grep -E '^([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|([0-9]{1,3}\.){3}[0-9]{1,3})$')
+    # Use an updated regex to match valid domain names and IPs
+    mapfile -t url_list < <(find . -maxdepth 1 -type d -printf '%f\n' | grep -E '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}$|^([0-9]{1,3}\.){3}[0-9]{1,3}$')
     url_list=("${url_list[@]:0:9}")
 
+    # Check if no valid domains or IPs are found
     if [ "${#url_list[@]}" -eq 0 ]; then
         echo "No valid domains/IPs found."
         gen_logs "No valid domains or IP directories found in select_url." msg
         exit 1
     fi
 
+    # Display the list of valid domains/IPs
     for i in "${!url_list[@]}"; do
         echo "($((i+1))) ${url_list[$i]}"
     done
@@ -561,11 +570,13 @@ function select_url {
     echo "(0) Exit"
     echo ""
 
+    # Prompt the user for selection
     [[ "$langsel" = "1" ]] && prompt="Bitte geben Sie Ihre Auswahl an: " || prompt="Please enter your selection: "
     echo -n "$prompt"
     read -n 1 urlsel
     echo ""
 
+    # Validate the selection and set the site_url
     if [[ "$urlsel" =~ ^[1-9]$ ]] && (( urlsel <= ${#url_list[@]} )); then
         site_url="${url_list[$((urlsel-1))]}"
         gen_logs "User selected site directory: $site_url" msg
@@ -581,7 +592,6 @@ function select_url {
         select_url "$1"
     fi
 }
-
 
 ##############################
 # Select SSH Keys            #
@@ -707,17 +717,23 @@ fi
 # Get IP, Hostname           #
 ##############################
 
-local_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $NF; exit}')
+# Get the local IP address (used if the hostname isn't valid)
+local_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
+
+# Get the fully qualified hostname (if available)
 host_name=$(hostname -f 2>/dev/null | awk '{print tolower($0)}')
 
+# Fallback if hostname is empty or unreliable
 if [ -z "$host_name" ]; then
     host_name=$(hostname | awk '{print tolower($0)}')
 fi
 
-if [ -z "$host_name" ]; then
+# Replace unreliable hostnames with IP (e.g., localhost or ubuntu)
+if [[ -z "$host_name" || "$host_name" =~ ^(localhost|ubuntu|0)$ ]]; then
     host_name="$local_ip"
 fi
 
+# Ensure proper /etc/hosts entry if needed for hostname resolution
 if ! grep -qE "127\.0\.1\.1\s+$host_name" /etc/hosts; then
     if ! [[ "$host_name" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "Fixing /etc/hosts for hostname resolution: $host_name"
@@ -728,9 +744,26 @@ if ! grep -qE "127\.0\.1\.1\s+$host_name" /etc/hosts; then
     fi
 fi
 
-
+# Log the resolved hostname and IP address
 gen_logs "Hostname and IP - $host_name, $local_ip" msg
 
+# Ensure correct site URL if not already set
+if [ -z "$site_url" ]; then
+    site_url="$host_name"
+    gen_logs "No site_url selected, using hostname: $site_url" msg
+fi
+
+# Ensure /etc/hosts maps site_url to local IP if it's not an IP
+if ! [[ "$site_url" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if ! grep -q "$site_url" /etc/hosts; then
+        echo "$local_ip $site_url" >> /etc/hosts
+        gen_logs "Mapped $site_url to $local_ip in /etc/hosts" msg
+    fi
+fi
+
+# Ensure the selected site URL is accessible and valid
+echo "Using site URL: $site_url"
+gen_logs "Selected site URL: $site_url" msg
 
 ##############################
 # Choose Mode                #
@@ -753,10 +786,10 @@ if [ ! -n "$yessel" ]; then
     yesno=""
     if [ "$langsel" = "1" ]; then
         gen_logs "Benutzer wird gefragt, ob Bibliotheken/Programme installiert werden sollen." msg
-        select_yesno "Es wird jetzt autoconf, automake, build-essential, curl, expect, gcc, \ndmidecode, lm-sensors, m4, make, net-tools, openjdk, openssl-dev, patch, pwgen,\nscreen, smartmontools, sqlite, sudo, sysstat, unzip und wget installiert."
+        select_yesno "Es wird jetzt autoconf, automake, build-essential, curl, expect, gcc, \ndmidecode, lm-sensors, m4, make, net-tools, openjdk, openssl-dev, patch, pwgen,\nscreen, smartmontools, sqlite, sudo, sysstat, gnupg, unzip und wget installiert."
     else
         gen_logs "User is prompted to install required packages and libraries." msg
-        select_yesno "Autoconf, automake, build-essential, curl, expect, gcc, dmidecode,\nlm-sensors, m4, make, net-tools, openjdk, openssl-dev, patch, pwgen, screen,\nsmartmontools, sqlite, sudo, sysstat, unzip and wget will now be installed."
+        select_yesno "Autoconf, automake, build-essential, curl, expect, gcc, dmidecode,\nlm-sensors, m4, make, net-tools, openjdk, openssl-dev, patch, pwgen, screen,\nsmartmontools, sqlite, sudo, sysstat, gnupg, unzip and wget will now be installed."
     fi
 fi
 
@@ -775,9 +808,9 @@ case "$os_install" in
         for i in autoconf automake m4 make screen sudo curl wget sqlite sqlite3 expect gcc \
                  libssh2-1-devel libopenssl-devel libmp3lame-devel libxml2-devel libxslt-devel \
                  libshout-devel libvorbis-devel dmidecode lm-sensors net-tools sysstat \
-                 smartmontools patch pwgen unzip java-11-openjdk git; do
+                 smartmontools patch pwgen unzip java-11-openjdk git gnupg; do
             gen_logs "zypper $chkyes $i" cmd
-            gen_logs "-" "${i}"
+            gen_logs "Installed package: ${i}" msg
         done
 
         gen_logs "zypper $chkyes -t pattern devel_basis" cmd
@@ -797,9 +830,9 @@ case "$os_install" in
         for i in autoconf automake build-essential m4 make debconf-utils screen sudo curl wget \
                  sqlite3 expect gcc libssh2-1-dev libssl-dev libmp3lame-dev libxml2-dev \
                  libshout-dev libvorbis-dev dmidecode lm-sensors net-tools sysstat \
-                 smartmontools patch pwgen unzip git; do
+                 smartmontools patch pwgen unzip git gnupg; do
             gen_logs "apt-get install $i $chkyes" cmd
-            gen_logs "-" "${i}"
+            gen_logs "Installed package: ${i}" msg
         done
 
         gen_logs "Installing Java (openjdk-17-jre)" msg
@@ -810,7 +843,7 @@ case "$os_install" in
         apt-get update
 
         gen_logs "Installing 32-bit libcurl for compatibility" msg
-        apt-get install libcurl4-gnutls-dev:i386 $chkyes
+        gen_logs "apt-get install libcurl4-gnutls-dev:i386 $chkyes" cmd
     ;;
 
     '3')  # CentOS / Red Hat / Fedora
@@ -838,9 +871,9 @@ case "$os_install" in
 
         for i in autoconf automake m4 make screen sudo curl wget sqlite expect gcc openssl-devel \
                  dmidecode lm-sensors net-tools sysstat smartmontools patch pwgen unzip \
-                 java-11-openjdk git; do
+                 java-11-openjdk git gnupg; do
             gen_logs "$pkgmgr install $i $chkyes" cmd
-            gen_logs "-" "${i}"
+            gen_logs "Installed package: ${i}" msg
         done
 
         gen_logs "$pkgmgr groupinstall 'Development Tools' $chkyes" cmd
@@ -878,8 +911,8 @@ if [[ "$modsel" -lt 8 ]]; then
             "2")  # Debian/Ubuntu
                 export DEBIAN_FRONTEND=noninteractive
                 gen_logs "apt-get install -y apache2" cmd || exit 1
-                systemctl enable apache2
-                systemctl restart apache2
+                gen_logs "systemctl enable apache2" cmd
+                gen_logs "systemctl restart apache2" cmd
                 ;;
             "3")  # RHEL/CentOS
                 gen_logs "yum install -y httpd" cmd || exit 1
@@ -987,56 +1020,78 @@ if [[ "$modsel" -lt 8 ]]; then
     chk_mysql $os_install
 
     if [ "$mysql_inst" = "0" ]; then
-        gen_logs "MySQL/MariaDB not found. Proceeding with installation." msg
+        echo "MySQL/MariaDB not found. Proceeding with installation."
+
         [ -z "$yessel" ] && {
             yesno=""
-            [ "$langsel" = "1" ] && \
-                select_yesno "MySQL/MariaDB Server wird installiert." || \
-                select_yesno "MySQL/MariaDB server will be installed."
+            [ "$langsel" = "1" ] && select_yesno "MySQL/MariaDB Server wird installiert." || select_yesno "MySQL/MariaDB server will be installed."
         }
 
         mysqlpwd=$(gen_passwd 12)
         echo "MySQL root password: $mysqlpwd" > /home/tekbase_mysql.txt
-        gen_logs "Generated MySQL root password stored in /home/tekbase_mysql.txt" msg
+        echo "Generated MySQL root password stored in /home/tekbase_mysql.txt"
 
         case "$os_install" in
             "1") # openSUSE
-                gen_logs "zypper --non-interactive install mariadb mariadb-tools" cmd
-                systemctl enable --now mariadb
+                zypper --non-interactive install mariadb mariadb-tools
+                systemctl enable mariadb
+                systemctl start mariadb
                 ;;
+
             "2") # Debian/Ubuntu
                 export DEBIAN_FRONTEND=noninteractive
+                apt-get update
                 debconf-set-selections <<< "mariadb-server mariadb-server/root_password password $mysqlpwd"
                 debconf-set-selections <<< "mariadb-server mariadb-server/root_password_again password $mysqlpwd"
-                gen_logs "apt-get install mariadb-server -y" cmd
+
+                gen_logs "apt-get install -y mariadb-server mariadb-client" cmd
+                gen_logs "systemctl enable mariadb" cmd
+                gen_logs "systemctl start mariadb" cmd
+
                 sleep 5
                 if mysqladmin ping >/dev/null 2>&1; then
-                    mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$mysqlpwd';"
-                    gen_logs "MySQL root password set via ALTER USER" msg
+                    echo "🔐 Switching root to password auth and setting password..."
+
+                    if mysql -u root -e "SELECT VERSION();" | grep -qi "mariadb"; then
+                        # ✅ MariaDB 10.4+ syntax
+                        mysql -u root <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${mysqlpwd}';
+FLUSH PRIVILEGES;
+EOF
+                    else
+                        # ✅ MySQL 8+ syntax
+                        mysql -u root <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${mysqlpwd}';
+FLUSH PRIVILEGES;
+EOF
+                    fi
+
+                    echo "✅ Root password updated successfully."
                 else
-                    gen_logs "MySQL server not responding to set root password" msg
+                    echo "⚠️ MySQL/MariaDB is not responding, skipping password update."
                 fi
-                systemctl enable --now mariadb
                 ;;
+
             "3") # RHEL/Fedora
                 pkgmgr=$(command -v dnf || echo yum)
-                gen_logs "$pkgmgr install mariadb-server mariadb -y" cmd
-                systemctl enable --now mariadb
+                $pkgmgr install mariadb-server mariadb -y
+                systemctl enable mariadb
+                systemctl start mariadb
                 ;;
         esac
 
         chk_mysql $os_install
         if [ "$mysql_inst" = "0" ]; then
-            color r x "MySQL/MariaDB could not be installed. Please install manually."
-            gen_logs "MySQL/MariaDB installation failed." msg
+            echo "❌ MySQL/MariaDB installation failed."
             echo "Check mysql: error" >> /home/tekbase_status.txt
             exit 1
         fi
+
         echo "Check mysql: ok" >> /home/tekbase_status.txt
-        gen_logs "MySQL/MariaDB successfully installed." msg
+        echo "✅ MySQL/MariaDB successfully installed."
     else
         echo "Check mysql: ok" >> /home/tekbase_status.txt
-        gen_logs "MySQL/MariaDB already installed." msg
+        echo "✅ MySQL/MariaDB already installed."
     fi
 
 fi
@@ -1046,10 +1101,10 @@ fi
 ##############################
 if [ "$modsel" -lt 8 ]; then
     if systemctl list-units --type=service | grep -q apache2; then
-        systemctl restart apache2
+        gen_logs "systemctl restart apache2" cmd
         gen_logs "Restarted apache2 service." msg
     elif systemctl list-units --type=service | grep -q httpd; then
-        systemctl restart httpd
+        gen_logs "systemctl restart httpd" cmd
         gen_logs "Restarted httpd service." msg
     fi
 
@@ -1073,10 +1128,10 @@ if [ "$modsel" -lt 8 ]; then
     fi
 
     if systemctl list-units --type=service | grep -q "php${php_version/./}-fpm"; then
-        systemctl restart "php${php_version/./}-fpm"
+        gen_logs "systemctl restart php${php_version/./}-fpm" cmd
         gen_logs "Restarted php${php_version/./}-fpm service." msg
     elif systemctl list-units --type=service | grep -q php-fpm; then
-        systemctl restart php-fpm
+        gen_logs "systemctl restart php-fpm" cmd
         gen_logs "Restarted php-fpm service." msg
     fi
 
@@ -1227,28 +1282,28 @@ if [ "$modsel" -lt 8 ]; then
         # Restart Apache
         if command -v systemctl >/dev/null 2>&1; then
             systemctl restart apache2
-            gen_logs "Apache2 restarted using systemctl" ""
+            gen_logs "Apache2 restarted using systemctl" msg
         else
             service apache2 restart
-            gen_logs "Apache2 restarted using service" ""
+            gen_logs "Apache2 restarted using service" msg
         fi
 
         # Restart PHP-FPM (if installed)
         if systemctl list-units --type=service | grep -q "php${php_version}-fpm"; then
             systemctl restart php${php_version}-fpm
-            gen_logs "PHP-FPM restarted using systemctl" ""
+            gen_logs "PHP-FPM restarted using systemctl" msg
         elif service "php${php_version}-fpm" status >/dev/null 2>&1; then
             service php${php_version}-fpm restart
-            gen_logs "PHP-FPM restarted using service" ""
+            gen_logs "PHP-FPM restarted using service" msg
         fi
     else
         # RHEL/CentOS/Fedora - Apache is httpd
         if command -v systemctl >/dev/null 2>&1; then
             systemctl restart httpd
-            gen_logs "httpd restarted using systemctl (RHEL/CentOS)" ""
+            gen_logs "httpd restarted using systemctl (RHEL/CentOS)" msg
         else
             service httpd restart
-            gen_logs "httpd restarted using service (RHEL/CentOS)" ""
+            gen_logs "httpd restarted using service (RHEL/CentOS)" msg
         fi
     fi
 fi
@@ -1297,6 +1352,8 @@ if [ $modsel -lt 8 ]; then
             	        apt-get install postfix
                         gen_logs "Installed postfix using apt-get" "postfix"
             	    fi
+            	    gen_logs "systemctl enable postfix" cmd
+                  gen_logs "systemctl restart postfix" cmd
     	        ;;
     	        '3')
             	    clear
@@ -1319,7 +1376,7 @@ fi
 ##############################
 if [ "$os_install" = "2" ]; then
     apt-get install qstat
-    gen_logs "Installed qstat from apt" "qstat"
+    gen_logs "Installed qstat from apt" msg
     if [ -f /usr/bin/qstat ]; then
         chmod 0755 /usr/bin/qstat
         cp /usr/bin/qstat /
@@ -1329,7 +1386,7 @@ if [ "$os_install" = "2" ]; then
         chmod 0755 /usr/bin/quakestat
         cp /usr/bin/quakestat /usr/bin/qstat
         cp /usr/bin/qstat /
-        gen_logs "Fallback to quakestat as qstat" "qstat"
+        gen_logs "Fallback to quakestat as qstat" msg
     fi
 fi
 
@@ -1337,7 +1394,7 @@ if [ ! -f /qstat ]; then
     cd $installhome
     if [ ! -f qstat.tar.gz ]; then
         wget --no-check-certificate https://teklab.s3.amazonaws.com/tekbase_qstat.tar.gz
-        gen_logs "Downloaded qstat package" ""
+        gen_logs "Downloaded qstat package" msg
         tar -xzf tekbase_qstat.tar.gz
         rm tekbase_qstat.tar.gz
     else
@@ -1347,7 +1404,7 @@ if [ ! -f /qstat ]; then
 
     cd qstat
     ./configure && make all install
-    gen_logs "Compiled and installed qstat" "qstat"
+    gen_logs "Compiled and installed qstat" msg
     chmod 0755 qstat
     cp qstat /usr/bin
     cp qstat /
@@ -1361,14 +1418,14 @@ if [ ! -f /qstat ]; then
 
     if [ ! -f /qstat ]; then
         echo "Check qstat: error" >> /home/tekbase_status.txt
-        gen_logs "Qstat binary not found after install" "qstat"
+        gen_logs "Qstat binary not found after install" msg
     else
         echo "Check qstat: ok" >> /home/tekbase_status.txt
-        gen_logs "Qstat installed successfully" "qstat"
+        gen_logs "Qstat installed successfully" msg
     fi
 else
     echo "Check qstat: ok" >> /home/tekbase_status.txt
-    gen_logs "Qstat already exists, skipping" "qstat"
+    gen_logs "Qstat already exists, skipping" msg
 fi
 
 
@@ -1379,70 +1436,76 @@ if [ "$modsel" = "1" ] || [ "$modsel" = "2" ] || [ "$modsel" = "4" ] || [ "$mods
     if [ ! -f skripte.tar ]; then
         cd /home
         git clone https://github.com/teklab-de/tekbase-scripts-linux.git skripte
-        gen_logs "Cloned tekbase-scripts-linux.git into /home/skripte" ""
+        gen_logs "Cloned tekbase-scripts-linux.git into /home/skripte" msg
         if [ ! -f /home/skripte/autoupdater ]; then
             cd $installhome
             wget --no-check-certificate https://teklab.s3.amazonaws.com/tekbase_scripts.tar
             tar -xzf tekbase_scripts.tar -C /home
             rm tekbase_scripts.tar
-            gen_logs "Downloaded and extracted tekbase_scripts.tar" ""
+            gen_logs "Downloaded and extracted tekbase_scripts.tar" msg
         fi
-        cd skripte
-        mkdir cache
+        # Ensure we are in /home/skripte
+        cd /home/skripte 2>/dev/null || {
+            echo "⚠️ /home/skripte does not exist"
+            exit 1
+        }
+
+        # Create the 'cache' directory if it doesn't exist
+        mkdir -p cache
         chmod 755 *
         chmod 777 cache
-        gen_logs "Prepared skripte folder with permissions and cache/" ""
+        gen_logs "Prepared skripte folder with permissions and cache/" msg
         cd $installhome
     else
         tar -xzf skripte.tar -C /home
         rm skripte.tar
-        gen_logs "Extracted skripte.tar to /home" ""
+        gen_logs "Extracted skripte.tar to /home" msg
     fi
 
     if [ ! -f hlstats.tar ]; then
         wget --no-check-certificate https://teklab.s3.amazonaws.com/tekbase_hlstats.tar
         tar -xzf tekbase_hlstats.tar -C /home/skripte
         rm tekbase_hlstats.tar
-        gen_logs "Downloaded and extracted tekbase_hlstats.tar" ""
+        gen_logs "Downloaded and extracted tekbase_hlstats.tar" msg
     else
         tar -xzf hlstats.tar -C /home/skripte
         rm hlstats.tar
-        gen_logs "Extracted hlstats.tar to /home/skripte" ""
+        gen_logs "Extracted hlstats.tar to /home/skripte" msg
     fi
 
     userpwd=$(gen_passwd 8)
     useradd -g users -p $(perl -e 'print crypt("'$userpwd'","Sa")') -s /bin/bash -m user-webi -d /home/user-webi
-    gen_logs "Created user-webi with generated password" ""
+    gen_logs "Created user-webi with generated password" msg
 
     cd $installhome
     if [ ! -f user-webi.tar ]; then
         wget --no-check-certificate https://teklab.s3.amazonaws.com/tekbase_user-webi.tar
         tar -xzf tekbase_user-webi.tar -C /home
         rm tekbase_user-webi.tar
-        gen_logs "Downloaded and extracted tekbase_user-webi.tar" ""
+        gen_logs "Downloaded and extracted tekbase_user-webi.tar" msg
     else
         tar -xzf user-webi.tar -C /home
         rm user-webi.tar
-        gen_logs "Extracted user-webi.tar to /home" ""
+        gen_logs "Extracted user-webi.tar to /home" msg
     fi
 
     if [ ! -f keys.tar ]; then
         wget --no-check-certificate https://teklab.s3.amazonaws.com/tekbase_keys.tar
         tar -xzf tekbase_keys.tar -C /home/user-webi
         rm tekbase_keys.tar
-        gen_logs "Downloaded and extracted tekbase_keys.tar to /home/user-webi" ""
+        gen_logs "Downloaded and extracted tekbase_keys.tar to /home/user-webi" msg
     else
         tar -xzf keys.tar -C /home/user-webi
         rm keys.tar
-        gen_logs "Extracted keys.tar to /home/user-webi" ""
+        gen_logs "Extracted keys.tar to /home/user-webi" msg
     fi
 
     if [ -d /home/skripte ]; then
         echo "Check scripts: ok" >> /home/tekbase_status.txt
-        gen_logs "Script installation completed successfully." ""
+        gen_logs "Script installation completed successfully." msg
     else
         echo "Check scripts: error" >> /home/tekbase_status.txt
-        gen_logs "Script installation failed: /home/skripte not found." ""
+        gen_logs "Script installation failed: /home/skripte not found." msg
     fi
 fi
 
@@ -1455,7 +1518,7 @@ if [[ "$modsel" =~ ^(1|2|4|5|8|9)$ ]]; then
         cp /etc/sudoers /etc/sudoers.tekbase
         echo "root ALL=(ALL:ALL) ALL" > /etc/sudoers
         chmod 0440 /etc/sudoers
-        gen_logs "Reset sudoers for CentOS/RHEL safely." ""
+        gen_logs "Reset sudoers for CentOS/RHEL safely." msg
     fi
 
     rm -f /etc/sudoers.d/user-webi
@@ -1465,7 +1528,7 @@ user-webi ALL=(ALL) NOPASSWD: /home/skripte/tekbase, /usr/bin/useradd, /usr/bin/
 EOF
 
     chmod 0440 /etc/sudoers.d/user-webi
-    gen_logs "Configured /etc/sudoers.d/user-webi with proper permissions." ""
+    gen_logs "Configured /etc/sudoers.d/user-webi with proper permissions." msg
 fi
 
 
@@ -1480,85 +1543,167 @@ if [ "$modsel" = "1" ] || [ "$modsel" = "2" ] || [ "$modsel" = "4" ] || [ "$mods
         echo "Check sudo: ok" >> /home/tekbase_status.txt
         userdel tekbasewi
         rm -r /home/tekbasewi
-        gen_logs "Sudo test passed — user-webi can run tekbase as root." ""
+        gen_logs "Sudo test passed — user-webi can run tekbase as root." msg
     else
         echo "Check sudo: error" >> /home/tekbase_status.txt
-        gen_logs "Sudo test failed — user-webi could not execute tekbase." ""
+        gen_logs "Sudo test failed — user-webi could not execute tekbase." msg
     fi
 fi
 
 
 ##############################
-# Install and Configure FTP  #
+# Install Ftp                #
 ##############################
-
 install_ftp="1"
-if [ -f /etc/proftpd.tekbase ] || [ -f /etc/proftpd.conf ] || [ -f /etc/proftpd/proftpd.conf ] || [ -f /etc/vsftpd.conf ]; then
+if [ -f /etc/proftpd.tekbase ]; then
+    install_ftp="0"
+fi
+if [ "$install_ftp" = "1" -a -f /etc/proftpd.conf ]; then
+    install_ftp="0"
+fi
+if [ "$install_ftp" = "1" -a -f /etc/proftpd/proftpd.conf ]; then
+    install_ftp="0"
+fi
+if [ "$install_ftp" = "1" -a -f /etc/vsftpd.conf ]; then
     install_ftp="0"
 fi
 
 if [ "$install_ftp" = "1" ]; then
     if [ "$os_install" = "1" ]; then
-        pkg_install="zypper"
-        pkg_opts="--non-interactive install"
-    elif [ "$os_install" = "2" ]; then
-        pkg_install="apt-get"
-        pkg_opts="-y install"
-        export DEBIAN_FRONTEND=noninteractive
-    elif [ "$os_install" = "3" ]; then
-        pkg_install="yum"
-        pkg_opts="-y install"
+        if [ "$modsel" != "7" ]; then
+            zypper --non-interactive install vsftpd
+        else
+            zypper install vsftpd
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable vsftpd
+            systemctl restart vsftpd
+        else
+            service vsftpd restart
+        fi
     fi
+    if [ "$os_install" = "2" ]; then
+        if [ "$modsel" != "7" ]; then
+            export DEBIAN_FRONTEND=noninteractive
+            debconf-set-selections <<< "proftpd-basic shared/proftpd/inetd_or_standalone select standalone"
+            apt-get install proftpd -y
+        else
+            apt-get install proftpd
+        fi
 
-    gen_logs "$pkg_install $pkg_opts vsftpd" cmd
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable --now proftpd
+            gen_logs "Enabled and started ProFTPD with systemctl" msg
+        else
+            service proftpd restart
+            gen_logs "Restarted ProFTPD with service" msg
+        fi
+    fi
+    if [ "$os_install" = "3" ]; then
+        if [ "$modsel" != "7" ]; then
+            yum install proftpd -y
+        else
+            yum install proftpd
+        fi
+    fi
 fi
+
 
 ##############################
 # Configure FTP              #
 ##############################
+
+# --- ProFTPD setup ---
+if systemctl list-units --type=service | grep -q proftpd; then
+    # Determine proftpd config path
+    if [ -f /etc/proftpd.conf ]; then
+        ftp_file="/etc/proftpd.conf"
+    elif [ -f /etc/proftpd/proftpd.conf ]; then
+        ftp_file="/etc/proftpd/proftpd.conf"
+    else
+        # Create default config if missing
+        mkdir -p /etc/proftpd
+        ftp_file="/etc/proftpd/proftpd.conf"
+        cat > "$ftp_file" <<EOF
+ServerName                      "ProFTPD"
+ServerType                      standalone
+DefaultServer                   on
+Port                            21
+Umask                           022
+MaxInstances                    30
+UseSendfile                     off
+EOF
+    fi
+
+    # Ensure passwd/group files exist
+    if [ ! -f /etc/proftpd/ftpd.passwd ]; then
+        touch /etc/proftpd/ftpd.passwd
+        chmod 440 /etc/proftpd/ftpd.passwd
+        chown proftpd:root /etc/proftpd/ftpd.passwd
+        touch /etc/proftpd/ftpd.group
+        chmod 440 /etc/proftpd/ftpd.group
+        chown proftpd:root /etc/proftpd/ftpd.group
+    fi
+
+    # Backup config
+    cp "$ftp_file" /etc/proftpd.tekbase
+
+    # Append settings from proftpd_settings.cfg if available
+    cd "$installhome"
+    if [ -f proftpd_settings.cfg ]; then
+        grep -Fxf proftpd_settings.cfg "$ftp_file" >/dev/null 2>&1 || {
+            cat proftpd_settings.cfg >> "$ftp_file"
+            echo "" >> "$ftp_file"
+        }
+    fi
+
+    # Clean duplicate or conflicting entries
+    sed -i '/^UseReverseDNS*/d' "$ftp_file"
+    sed -i '/^IdentLookups*/d' "$ftp_file"
+    sed -i '/^DefaultRoot*/d' "$ftp_file"
+    sed -i '/^AuthGroupFile*/d' "$ftp_file"
+    sed -i '/^AllowOverwrite*/d' "$ftp_file"
+    sed -i '/^AuthUserFile*/d' "$ftp_file"
+    sed -i '/^RequireValidShell*/d' "$ftp_file"
+    sed -i '/^AuthOrder*/d' "$ftp_file"
+
+    # Apply base TekBASE overrides
+    {
+        echo "AllowOverwrite on"
+        echo "UseReverseDNS off"
+        echo "DefaultRoot ~"
+        echo "RequireValidShell off"
+        echo "AuthOrder mod_auth_pam.c mod_auth_unix.c"
+    } >> "$ftp_file"
+
+    systemctl restart proftpd
+
+    if systemctl is-active --quiet proftpd; then
+        echo "Check proftpd: ok" >> /home/tekbase_status.txt
+    else
+        echo "Check proftpd: error" >> /home/tekbase_status.txt
+    fi
+else
+    echo "Check proftpd: not installed" >> /home/tekbase_status.txt
+fi
+
+# --- VSFTPD setup ---
 if [ -f /etc/vsftpd.conf ]; then
     cp /etc/vsftpd.conf /etc/vsftpd.tekbase
 
-    sed -i '/write_enable/c\write_enable=YES' /etc/vsftpd.conf
-    sed -i '/chroot_local_user/c\chroot_local_user=YES' /etc/vsftpd.conf
-    sed -i '/userlist_enable/c\userlist_enable=NO' /etc/vsftpd.conf
+    sed -i 's/^write_enable=.*/write_enable=YES/' /etc/vsftpd.conf
+    sed -i 's/^chroot_local_user=.*/chroot_local_user=YES/' /etc/vsftpd.conf
+    sed -i 's/^userlist_enable=.*/userlist_enable=NO/' /etc/vsftpd.conf
 
-    if command -v systemctl >/dev/null; then
-        systemctl restart vsftpd
-    else
-        service vsftpd restart
-    fi
+    systemctl restart vsftpd
 
-    if [ $? -eq 0 ]; then
+    if systemctl is-active --quiet vsftpd; then
         echo "Check vsftpd: ok" >> /home/tekbase_status.txt
-        gen_logs "vsftpd configured and restarted successfully" msg
     else
         echo "Check vsftpd: error" >> /home/tekbase_status.txt
-        gen_logs "vsftpd restart failed" msg
     fi
 else
-    echo "Check vsftpd: error" >> /home/tekbase_status.txt
-    gen_logs "vsftpd installation failed (config not found)" msg
-fi
-
-##############################
-# Check and Remove ProFTPD   #
-##############################
-if [ -f /etc/proftpd.conf ] || [ -f /etc/proftpd/proftpd.conf ]; then
-    gen_logs "ProFTPD installation detected — removing." msg
-
-    if [ "$os_install" = "1" ]; then
-        zypper remove -y proftpd
-        gen_logs "Removed proftpd (zypper)" msg
-    elif [ "$os_install" = "2" ]; then
-        apt-get remove --purge -y proftpd
-        gen_logs "Removed proftpd (apt-get)" msg
-    elif [ "$os_install" = "3" ]; then
-        yum remove -y proftpd
-        gen_logs "Removed proftpd (yum)" msg
-    fi
-
-    echo "Check proftpd: removed" >> /home/tekbase_status.txt
+    echo "Check vsftpd: not installed" >> /home/tekbase_status.txt
 fi
 ##############################
 # Configure TS3 Firewall     #
@@ -1657,6 +1802,10 @@ if [ "$modsel" = "1" ] || [ "$modsel" = "4" ] || [ "$modsel" = "8" ]; then
     cd /home/user-webi/teamspeak3
     su user-webi -c "touch .ts3server_license_accepted"
 
+    # Remove stale pid and lock files that may block startup
+    rm -f /home/user-webi/teamspeak3/ts3server.pid
+    rm -f /dev/shm/7* 2>/dev/null || true
+
     su user-webi -c "./ts3server_startscript.sh start serveradmin_password=$adminpwd createinifile=1 inifile=ts3server.ini > tsout.txt 2>&1"
     sleep 20
     su user-webi -c "./ts3server_startscript.sh stop"
@@ -1665,7 +1814,7 @@ if [ "$modsel" = "1" ] || [ "$modsel" = "4" ] || [ "$modsel" = "8" ]; then
 
     token=$(awk -F= '/token=/{print $2}' tsout.txt | tr -d '[:space:]')
     if [ -n "$token" ]; then
-        echo "$token" > /home/tekbase_ts3.txt
+        echo "Token: $token" > /home/tekbase_ts3.txt
         gen_logs "TeamSpeak token extracted and saved" msg
     else
         echo "No token generated." > /home/tekbase_ts3.txt
@@ -1714,7 +1863,7 @@ if [[ "$modsel" =~ ^(1|2|4|5|8|9)$ ]]; then
     daemonport=1500
     sed -i '/^password[[:space:]]*=/c\password = '"$daemonpwd"'' tekbase.cfg
     sed -i '/^listen_port[[:space:]]*=/c\listen_port = '"$daemonport"'' tekbase.cfg
-    gen_logs "Set initial daemon password and port (1500)" ""
+    gen_logs "Set initial daemon password and port (1500)" msg
 
     while true; do
         daemonport=$((daemonport + 1))
@@ -1725,29 +1874,28 @@ if [[ "$modsel" =~ ^(1|2|4|5|8|9)$ ]]; then
         fi
         if [ -z "$portcheck" ]; then
             sed -i '/^listen_port[[:space:]]*=/c\listen_port = '"$daemonport"'' tekbase.cfg
-            gen_logs "Free port $daemonport selected for daemon" ""
+            gen_logs "Free port $daemonport selected for daemon" msg
             break
         fi
     done
 
     echo "Daemon Port: $daemonport" > /home/tekbase_daemon.txt
     echo "Daemon Password: $daemonpwd" >> /home/tekbase_daemon.txt
-    gen_logs "Daemon credentials saved" ""
+    gen_logs "Daemon credentials saved" msg
 fi
 
 ##############################
 # Configure WWW              #
 ##############################
 if [ "$modsel" -lt 8 ]; then
-    site_url=$host_name
     wwwok=0
 
     possible_paths=(
         "/home/www/web0/html:/var/www/web0/html"
-        "/var/www/vhosts/$site_url/httpdocs"
+        "/var/www/vhosts/$host_name/httpdocs"
         "/var/www/vhosts/default/htdocs"
         "/var/www/virtual/default"
-        "/srv/www/vhosts/$site_url/httpdocs"
+        "/srv/www/vhosts/$host_name/httpdocs"
         "/srv/www/vhosts/default/htdocs"
         "/srv/www/virtual/default"
         "/var/www/htdocs"
@@ -1765,30 +1913,95 @@ if [ "$modsel" -lt 8 ]; then
         if [ -d "$base_path" ]; then
             wwwpath="${real_path:-$base_path}"
             wwwok=1
-            [ -n "$local_ip" ] && [[ "$base_path" == "/srv/www" || "$base_path" == "/var/www" ]] && site_url="$local_ip"
-            gen_logs "Web path found: $wwwpath for site $site_url" ""
+            gen_logs "Web path found and selected: $wwwpath" msg
             break
         fi
     done
 
+    # ⬇️ Extra fallback logic (from older version)
     if [ "$wwwok" = "0" ]; then
-        if [ "$os_install" = "1" ]; then
-            mkdir -p /srv/www
+        site_url="$host_name"
+
+        [ -d /home/www/web0/html ] && wwwpath="/var/www/web0/html" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /var/www/vhosts/$site_url/httpdocs ] && wwwpath="/var/www/vhosts/$site_url/httpdocs" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /var/www/vhosts/default/htdocs ] && wwwpath="/var/www/vhosts/default/htdocs" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /var/www/virtual/default ] && wwwpath="/var/www/virtual/default" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /var/www/web0/html ] && wwwpath="/var/www/web0/html" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /srv/www/vhosts/$site_url/httpdocs ] && wwwpath="/srv/www/vhosts/$site_url/httpdocs" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /srv/www/vhosts/default/htdocs ] && wwwpath="/srv/www/vhosts/default/htdocs" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /srv/www/virtual/default ] && wwwpath="/srv/www/virtual/default" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /var/www/htdocs ] && wwwpath="/var/www/htdocs" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /srv/www/web0/html ] && wwwpath="/srv/www/web0/html" && wwwok=1
+        [ "$wwwok" = "0" ] && [ -d /srv/www/htdocs ] && wwwpath="/srv/www/htdocs" && wwwok=1
+        if [ "$wwwok" = "0" ] && [ -d /srv/www ]; then
             wwwpath="/srv/www"
-        else
-            mkdir -p /var/www
-            wwwpath="/var/www"
+            wwwok=1
+            [ -n "$local_ip" ] && site_url="$local_ip"
         fi
-        [ -n "$local_ip" ] && site_url="$local_ip"
-        gen_logs "No known web path found. Created default: $wwwpath" ""
+        if [ "$wwwok" = "0" ] && [ -d /var/www/html ]; then
+            wwwpath="/var/www/html"
+            wwwok=1
+            [ -n "$local_ip" ] && site_url="$local_ip"
+        fi
+        if [ "$wwwok" = "0" ] && [ -d /var/www ]; then
+            wwwpath="/var/www"
+            wwwok=1
+            [ -n "$local_ip" ] && site_url="$local_ip"
+        fi
+        if [ "$wwwok" = "0" ]; then
+            if [ "$os_install" = "1" ]; then
+                mkdir -p /srv/www
+                wwwpath="/srv/www"
+            else
+                mkdir -p /var/www
+                wwwpath="/var/www"
+            fi
+            [ -n "$local_ip" ] && site_url="$local_ip"
+        fi
+        gen_logs "Fallback logic selected path: $wwwpath" msg
     fi
 
     chk_panel
+
+    # Plesk handling
     if [ "$web_panel" = "Plesk" ] && [ -d /var/www/vhosts ]; then
         select_url "/var/www/vhosts"
         wwwpath="/var/www/vhosts/$site_url/httpdocs"
-        gen_logs "Plesk panel detected, selected path: $wwwpath" ""
+        gen_logs "Plesk panel detected, selected path: $wwwpath" msg
+    else
+        # Use IP as fallback site_url
+        if [ -z "$site_url" ]; then
+            site_url="$local_ip"
+            gen_logs "Using local_ip as site_url: $site_url" msg
+        fi
+
+        # Apache VHost auto-creation
+        if [[ "$web_panel" = "0" ]]; then
+            vhost_file="/etc/apache2/sites-available/$site_url.conf"
+            if [ ! -f "$vhost_file" ]; then
+                mkdir -p "$wwwpath"
+                cat <<EOF > "$vhost_file"
+<VirtualHost *:80>
+    ServerName $site_url
+    DocumentRoot "$wwwpath"
+    <Directory "$wwwpath">
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+    ErrorLog \${APACHE_LOG_DIR}/$site_url-error.log
+    CustomLog \${APACHE_LOG_DIR}/$site_url-access.log combined
+</VirtualHost>
+EOF
+                a2ensite "$site_url.conf"
+                systemctl reload apache2
+                gen_logs "Created Apache vhost for $site_url and reloaded Apache" msg
+            fi
+        fi
     fi
+
+    echo "Selected site URL: $site_url"
+    echo "Web root path: $wwwpath"
 fi
 
 ##############################
@@ -1796,8 +2009,8 @@ fi
 ##############################
 if [ "$modsel" -lt 8 ] && [ "$web_panel" = "Plesk" ] && [ -d /var/www/vhosts ]; then
     if [ "$os_install" = "2" ]; then
-        apt-get install $chkyes libgeoip-dev geoip-bin geoip-database libssh2-1-dev
-        gen_logs "Installed Plesk dependencies (geoip, ssh2 libs)" ""
+        apt-get install -y libgeoip-dev geoip-bin geoip-database libssh2-1-dev
+        gen_logs "Installed Plesk dependencies (geoip, ssh2 libs)" msg
     fi
 
     cd /opt/plesk/php
@@ -1811,8 +2024,8 @@ if [ "$modsel" -lt 8 ] && [ "$web_panel" = "Plesk" ] && [ -d /var/www/vhosts ]; 
 
             if [ -d "$phpbin" ]; then
                 for pkg in dev gd mbstring mysql xml; do
-                    apt-get install $chkyes "plesk-php${phpv}-$pkg"
-                    gen_logs "Installed plesk-php${phpv}-$pkg" ""
+                    apt-get install -y "plesk-php${phpv}-$pkg"
+                    gen_logs "Installed plesk-php${phpv}-$pkg" msg
                 done
 
                 "$phpbin/pecl" install -f ssh2-1.4.1
@@ -1823,8 +2036,8 @@ if [ "$modsel" -lt 8 ] && [ "$web_panel" = "Plesk" ] && [ -d /var/www/vhosts ]; 
                     [ -f "$phplib/geoip.so" ] && echo "extension=geoip.so" > "$phpcfg/geoip.ini"
                 fi
 
-                /etc/init.d/plesk-php${phpv}-fpm restart
-                gen_logs "Restarted plesk-php${phpv}-fpm" ""
+                systemctl restart plesk-php${phpv}-fpm
+                gen_logs "Restarted plesk-php${phpv}-fpm" msg
             fi
         fi
     done
@@ -1838,46 +2051,60 @@ if [ "$modsel" -lt 8 ]; then
 
     if [[ "$php_version" == "5.6" || "$php_version" == "7.0" ]]; then
         wget --no-check-certificate https://teklab.s3.amazonaws.com/tekbase_php56.zip
-        gen_logs "Downloaded TekBASE for PHP $php_version" ""
+        gen_logs "Downloaded TekBASE for PHP $php_version" msg
     else
         wget --no-check-certificate https://teklab.s3.amazonaws.com/tekbase.zip
-        gen_logs "Downloaded latest TekBASE" ""
+        gen_logs "Downloaded latest TekBASE" msg
     fi
 
     unzip tekbase*.zip && rm tekbase*.zip
-    mv tekbase "$wwwpath"
-    gen_logs "Unzipped and moved TekBASE to $wwwpath" ""
+    mkdir -p "$wwwpath/tekbase"
+    mv tekbase/* "$wwwpath/tekbase"
+    gen_logs "Moved TekBASE into $wwwpath/tekbase" msg
 
     tekpwd=$(gen_passwd 8)
     tekdb=$(gen_passwd 4)
 
     if [ "$os_install" = "2" ]; then
-        mysqlpwd=$(awk '/password/ {print $3; exit}' /etc/mysql/debian.cnf)
-        mysqlusr=$(awk '/user/ {print $3; exit}' /etc/mysql/debian.cnf)
+        # Use generated root password
+        if [ -f /home/tekbase_mysql.txt ]; then
+            mysqlpwd=$(awk -F': ' '/MySQL root password/ {print $2}' /home/tekbase_mysql.txt)
+            mysqlusr="root"
+        elif [ -s /etc/mysql/debian.cnf ]; then
+            mysqlpwd=$(awk '/password/ {print $3; exit}' /etc/mysql/debian.cnf)
+            mysqlusr=$(awk '/user/ {print $3; exit}' /etc/mysql/debian.cnf)
+        else
+            mysqlusr="root"
+            echo -e "\n⚠️  Could not read MySQL credentials. Please enter root password:"
+            read -r mysqlpwd
+        fi
     else
         mysqlusr="root"
         if [ -z "$mysqlpwd" ]; then
-            clear
-            if [ "$langsel" = "1" ]; then
-                echo -e "Bitte geben Sie das MySQL Root Passwort ein:\n"
-            else
-                echo -e "Please input the MySQL Root password:\n"
-            fi
+            echo -e "Please input the MySQL Root password:\n"
             read -r mysqlpwd
         fi
     fi
 
-    mysql --user="$mysqlusr" --password="$mysqlpwd" -e "
-        SET sql_mode = '';
-        CREATE DATABASE IF NOT EXISTS tekbase_$tekdb;
-        GRANT ALL PRIVILEGES ON tekbase_$tekdb.* TO 'tekbase_$tekdb'@'localhost' IDENTIFIED BY '$tekpwd';
-        FLUSH PRIVILEGES;
-    "
-    gen_logs "Created MySQL database tekbase_$tekdb and granted user access" ""
+    # Create DB and user
+    mysql --user="$mysqlusr" --password="$mysqlpwd" <<EOF
+SET sql_mode = '';
+CREATE DATABASE IF NOT EXISTS tekbase_$tekdb;
+CREATE USER IF NOT EXISTS 'tekbase_$tekdb'@'localhost' IDENTIFIED BY '$tekpwd';
+GRANT ALL PRIVILEGES ON tekbase_$tekdb.* TO 'tekbase_$tekdb'@'localhost';
+FLUSH PRIVILEGES;
+EOF
 
-    mysql --user=tekbase_$tekdb --password=$tekpwd tekbase_$tekdb < "$wwwpath/tekbase/install/database.sql"
-    rm -r "$wwwpath/tekbase/install"
-    gen_logs "Imported initial TekBASE schema and removed installer" ""
+    gen_logs "✅ Created MySQL database tekbase_$tekdb and granted user access" msg
+
+    # Import TekBASE schema
+    if mysql --user=tekbase_$tekdb --password="$tekpwd" tekbase_$tekdb < "$wwwpath/tekbase/install/database.sql"; then
+        gen_logs "✅ Imported TekBASE schema" msg
+        rm -r "$wwwpath/tekbase/install"
+    else
+        gen_logs "❌ Failed to import TekBASE schema" err
+        echo "Check mysql import: error" >> /home/tekbase_status.txt
+    fi
 
     cat <<EOF > "$wwwpath/tekbase/config.php"
 <?php
@@ -1898,24 +2125,33 @@ if [ "$modsel" -lt 8 ]; then
 ?>
 EOF
 
-    chmod 0777 "$wwwpath"/tekbase/{cache,pdf,resources,tmp}
-
+    if [ -d "$wwwpath/tekbase" ]; then
+        chmod 0777 "$wwwpath/tekbase"/{cache,pdf,resources,tmp}
+        gen_logs "Permissions set on tekbase writable directories." msg
+    else
+        gen_logs "Directory $wwwpath/tekbase not found – cannot chmod." msg
+    fi
     useradd -g users -p "$(perl -e 'print crypt("'$tekpwd'", "Sa")')" -s /bin/bash -m tekbaseftp -d "$wwwpath/tekbase"
     chown -R tekbaseftp:users "$wwwpath/tekbase"
-    gen_logs "TekBASE config file created and permissions set" ""
+    gen_logs "TekBASE config file created and permissions set" msg
 
     echo -e "DB Login: tekbase_$tekdb\nDB Password: $tekpwd" > /home/tekbase_db.txt
     echo -e "FTP Login: tekbaseftp\nFTP Password: $tekpwd" > /home/tekbase_ftp.txt
 
     sleep 5
+    if command -v systemctl >/dev/null 2>&1; then
+        gen_logs "systemctl reload apache2" cmd
+    else
+        gen_logs "service apache2 reload" cmd
+    fi
     wget -q -O - "http://$site_url/tekbase/admin.php"
-    gen_logs "Triggered admin.php setup via HTTP" ""
+    gen_logs "Triggered admin.php setup via HTTP" msg
 else
     rm -rf "$installhome/tekbase"
 fi
 
 wget -q --post-data "op=insert&$site_url" -O - http://licenses1.tekbase.de/wiauthorized.php
-gen_logs "License inserted for $site_url" ""
+gen_logs "License inserted for $site_url" msg
 
 ##############################
 # DB Inserts                 #
@@ -1933,7 +2169,7 @@ if [ "$local_ip" != "" ]; then
     INSERT INTO teklab_rootserver (id, sshdaemon, daemonpasswd, path, sshuser, sshport, name, serverip, loadindex, apps, games, streams, voices, vserver, web, cpucores, active) VALUES (NULL, "0", "$daemonpwd", "/home/skripte", "user-webi", "$ssh_port", "$local_ip", "$local_ip", "500", "1", "1", "1", "1", "1", "1", "$cpu_threads", "1");
     INSERT INTO teklab_teamspeak (id, serverip, queryport, admin, passwd, path, typ, rserverid) VALUES (NULL, "$local_ip", "10011", "serveradmin", "$adminpwd", "teamspeak3", "Teamspeak3", "1");
 EOF
-    gen_logs "Inserted rootserver and Teamspeak info into TekBASE DB" ""
+    gen_logs "Inserted rootserver and Teamspeak info into TekBASE DB" msg
 fi
 
 
@@ -1958,11 +2194,11 @@ if [ "$modsel" != "3" ] || [ "$modsel" != "6" ]; then
         chown -R user-webi:users .ssh
         chmod 0700 .ssh
 
-        gen_logs "Generated SSH keys for user-webi" ""
+        gen_logs "Generated SSH keys for user-webi" msg
 
         if [ $modsel -lt 8 ]; then
             mv /home/user-webi/.ssh/id_rsa.* $wwwpath/tekbase/tmp
-            gen_logs "Moved private/public SSH keys to TekBASE tmp dir" ""
+            gen_logs "Moved private/public SSH keys to TekBASE tmp dir" msg
         fi
     fi
 fi
@@ -1975,7 +2211,7 @@ for FILE in $(find *.sh)
 do
     cp $FILE ${FILE%.sh}
 done
-gen_logs "Converted .sh scripts to TekBASE 8.x compatible format" ""
+gen_logs "Converted .sh scripts to TekBASE 8.x compatible format" msg
 
 ##############################
 # Finish                     #
@@ -1984,7 +2220,7 @@ cd $installhome
 cd /usr/local
 rm ioncube_x86-64.tar.gz
 rm ioncube_x86.tar.gz
-gen_logs "Cleaned up ioncube archives" ""
+gen_logs "Cleaned up ioncube archives" msg
 
 clear
 if [ $modsel -lt 8 ]; then
@@ -2012,7 +2248,7 @@ if [ $modsel -lt 8 ]; then
         echo "Rental/Buy versions get a FREE installation support."
     fi
     echo ""
-    gen_logs "TekBASE installation complete – Admin: http://$site_url/tekbase/admin.php" ""
+    gen_logs "TekBASE installation complete – Admin: http://$site_url/tekbase/admin.php" msg
 fi
 
 if [ "$modsel" = "1" ] || [ "$modsel" = "4" ] || [ "$modsel" = "8" ]; then
@@ -2024,7 +2260,7 @@ if [ "$modsel" = "1" ] || [ "$modsel" = "4" ] || [ "$modsel" = "8" ]; then
         echo "Serveradmin password in /home/tekbase_ts3.txt"
     fi
     echo ""
-    gen_logs "Teamspeak 3 base server installed" ""
+    gen_logs "Teamspeak 3 base server installed" msg
 fi
 
 if [ "$modsel" = "1" ] || [ "$modsel" = "2" ] || [ "$modsel" = "4" ] || [ "$modsel" = "5" ] || [ "$modsel" = "8" ] || [ "$modsel" = "9" ]; then
@@ -2037,6 +2273,14 @@ if [ "$modsel" = "1" ] || [ "$modsel" = "2" ] || [ "$modsel" = "4" ] || [ "$mods
         echo "su user-webi"
         echo "cd /home/skripte"
         echo "screen -A -m -d -S tekbasedaemon ./server"
+        echo ""
+        echo "📄 Übersicht der generierten Dateien:"
+        [ -f /home/tekbase_mysql.txt ]   && echo "    ✔️ /home/tekbase_mysql.txt      → MySQL Root-Passwort"
+        [ -f /home/tekbase_db.txt ]      && echo "    ✔️ /home/tekbase_db.txt         → TekBASE Datenbank-Zugang"
+        [ -f /home/tekbase_ftp.txt ]     && echo "    ✔️ /home/tekbase_ftp.txt        → FTP Zugangsdaten"
+        [ -f /home/tekbase_daemon.txt ]  && echo "    ✔️ /home/tekbase_daemon.txt     → Linux Daemon Zugangsdaten"
+        [ -f /home/tekbase_ts3.txt ]     && echo "    ✔️ /home/tekbase_ts3.txt        → Teamspeak Token & Admin"
+        [ -f /home/tekbase_status.txt ]  && echo "    ✔️ /home/tekbase_status.txt     → Status aller Komponenten"
     else
         echo "The root server has been completely set up. The linux daemon"
         echo "credentials are in the file /home/tekbase_daemon.txt."
@@ -2045,9 +2289,17 @@ if [ "$modsel" = "1" ] || [ "$modsel" = "2" ] || [ "$modsel" = "4" ] || [ "$mods
         echo "su user-webi"
         echo "cd /home/skripte"
         echo "screen -A -m -d -S tekbasedaemon ./server"
+        echo ""
+        echo "📄 Summary of generated files:"
+        [ -f /home/tekbase_mysql.txt ]   && echo "    ✔️ /home/tekbase_mysql.txt      → MySQL root password"
+        [ -f /home/tekbase_db.txt ]      && echo "    ✔️ /home/tekbase_db.txt         → TekBASE DB login"
+        [ -f /home/tekbase_ftp.txt ]     && echo "    ✔️ /home/tekbase_ftp.txt        → FTP login credentials"
+        [ -f /home/tekbase_daemon.txt ]  && echo "    ✔️ /home/tekbase_daemon.txt     → Linux Daemon credentials"
+        [ -f /home/tekbase_ts3.txt ]     && echo "    ✔️ /home/tekbase_ts3.txt        → TeamSpeak token & admin"
+        [ -f /home/tekbase_status.txt ]  && echo "    ✔️ /home/tekbase_status.txt     → Component installation status"
     fi
     echo ""
-    gen_logs "Linux daemon setup complete — startup instructions shown" ""
+    gen_logs "Linux daemon setup complete — startup instructions shown" msg
 fi
 
 if [ "$os_install" = "2" ]; then
